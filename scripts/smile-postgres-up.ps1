@@ -1,4 +1,4 @@
-# Find the newest SmileCDR Docker tarball in Downloads, load it, and start
+﻿# Find the newest SmileCDR Docker tarball in Downloads, load it, and start
 # SmileCDR + PostgreSQL with Postgres as the default database.
 [CmdletBinding()]
 param(
@@ -15,7 +15,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Resolve-Path (Join-Path $ScriptDir "..")
 $DockerDir = Join-Path $RepoRoot "docker"
+$ConfigFile = Join-Path $RepoRoot "config.env"
 $EnvExample = Join-Path $RepoRoot ".env.example"
+$SecretsFile = Join-Path $RepoRoot ".env"
 
 if (-not $DownloadsDir) {
     $DownloadsDir = Join-Path $env:USERPROFILE "Downloads"
@@ -190,6 +192,17 @@ function Update-SmileConfig {
     if ($raw -match '(?m)^\s*module\.fhir_endpoint\.config\.base_url\.fixed\s*=') {
         Set-Prop $File "module.fhir_endpoint.config.base_url.fixed" "http://localhost:$($Ports.FHIR_PORT)"
     }
+
+    # License JWT from container env (SMILE_LICENSE_KEY in repo-root .env).
+    Set-Prop $File "module.license.config.jwt_text" "#{env['SMILE_LICENSE_KEY']}"
+}
+
+function Get-ComposeEnvFileArgs {
+    [string[]]$argsList = @("--env-file", "$ConfigFile")
+    if (Test-Path -LiteralPath $SecretsFile) {
+        $argsList += [string[]]@("--env-file", "$SecretsFile")
+    }
+    return [string[]]$argsList
 }
 
 function Expand-ComposeTemplate {
@@ -253,16 +266,23 @@ $SafeVersion = ($SmileVersion -replace '\.', '-').ToLowerInvariant()
 $ProjectName = if ($Project) { $Project } else { "smilecdr-$SafeVersion" }
 
 New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
-$RuntimeEnv = Join-Path $RuntimeDir ".env"
-if (-not (Test-Path -LiteralPath $RuntimeEnv)) {
+
+if (-not (Test-Path -LiteralPath $ConfigFile)) {
+    Write-ErrExit "missing $ConfigFile"
+}
+if (-not (Test-Path -LiteralPath $SecretsFile)) {
     if (-not (Test-Path -LiteralPath $EnvExample)) {
         Write-ErrExit "missing $EnvExample"
     }
     $envText = [System.IO.File]::ReadAllText($EnvExample) -replace "`r`n", "`n" -replace "`r", "`n"
-    Write-TextFile -Path $RuntimeEnv -Content $envText
+    Write-TextFile -Path $SecretsFile -Content $envText
+    Write-Host "Created $SecretsFile from .env.example — set SMILE_LICENSE_KEY if you need premium modules."
 }
 
-Import-DotEnv $RuntimeEnv | Out-Null
+# Non-secret settings first; .env secrets override on name collision.
+Import-DotEnv $ConfigFile | Out-Null
+Import-DotEnv $SecretsFile | Out-Null
+$ComposeEnvArgs = Get-ComposeEnvFileArgs
 
 function Get-EnvOr([string]$Name, [string]$Default) {
     $v = [Environment]::GetEnvironmentVariable($Name)
@@ -302,15 +322,13 @@ if ($Down) {
         Write-ErrExit "no generated compose file at $ComposeFile; run without -Down first"
     }
     if ($DryRun) {
-        Write-Host "[dry-run] would run: docker compose -f $ComposeFile --project-name $ProjectName --env-file $RuntimeEnv down"
+        Write-Host "[dry-run] would run: docker compose -f $ComposeFile --project-name $ProjectName $($ComposeEnvArgs -join ' ') down"
         exit 0
     }
-    $code = Invoke-Docker @(
+    $code = Invoke-Docker (@(
         "compose", "-f", $ComposeFile,
-        "--project-name", $ProjectName,
-        "--env-file", $RuntimeEnv,
-        "down"
-    )
+        "--project-name", $ProjectName
+    ) + $ComposeEnvArgs + @("down"))
     if ($code -ne 0) { exit $code }
     Write-Host "Stack stopped."
     exit 0
@@ -385,12 +403,10 @@ Expand-ComposeTemplate `
     -Platform $SmilePlatform
 
 Write-Host "Starting stack..."
-$upCode = Invoke-Docker @(
+$upCode = Invoke-Docker (@(
     "compose", "-f", $ComposeFile,
-    "--project-name", $ProjectName,
-    "--env-file", $RuntimeEnv,
-    "up", "-d", "--build"
-)
+    "--project-name", $ProjectName
+) + $ComposeEnvArgs + @("up", "-d", "--build"))
 if ($upCode -ne 0) { exit $upCode }
 
 Write-Host @"

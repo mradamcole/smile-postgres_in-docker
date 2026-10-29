@@ -19,6 +19,7 @@ This is for local development and upgrade testing. It does not include NGINX or 
 
 ```powershell
 cd c:\github\smile-postgres_in-docker
+copy .env.example .env   # once; then set SMILE_LICENSE_KEY if needed
 .\scripts\smile-postgres-up.ps1
 ```
 
@@ -26,16 +27,19 @@ cd c:\github\smile-postgres_in-docker
 
 ```bash
 cd /path/to/smile-postgres_in-docker
+cp -n .env.example .env   # once; then set SMILE_LICENSE_KEY if needed
 chmod +x scripts/smile-postgres-up.sh
 ./scripts/smile-postgres-up.sh
 ```
+
+If `.env` is missing, the up script creates it from `.env.example`.
 
 Both scripts:
 
 1. Pick the highest SmileCDR version under Downloads (by `YYYY.MM.RNN`, not file date)
 2. Resolve a recent stable Postgres major from Docker Hub (fallback: `17`), using `postgres:{major}-alpine`
 3. Generate files under `.runtime/smilecdr-<version>/`
-4. Load the image if needed, patch `cdr-config-Master.properties` for Postgres, and `docker compose up -d --build`
+4. Load the image if needed, patch `cdr-config-Master.properties` for Postgres + license env substitution, and `docker compose up -d --build`
 
 When SmileCDR finishes starting, logs should include `Smile, we're up and running! :)`.
 
@@ -45,15 +49,18 @@ When SmileCDR finishes starting, logs should include `Smile, we're up and runnin
 | FHIRWeb | http://localhost:8001 |
 | FHIR API | http://localhost:8000 |
 | JSON Admin API | http://localhost:9000 |
-| Postgres (host) | `localhost:5432` (db/user `cdr` / password from `.env`) |
+| Postgres (host) | `localhost:5432` (db/user from `config.env`) |
 
-## Configure ports and credentials
+## Configuration vs secrets
 
-On first run the script copies [`.env.example`](.env.example) to:
+| File | Committed? | Purpose |
+|------|------------|---------|
+| [`config.env`](config.env) | Yes | Ports, Postgres settings, DB names, platform |
+| [`.env`](.env) (from [`.env.example`](.env.example)) | No | Secrets only |
 
-`.runtime/smilecdr-<version>/.env`
+Edit `config.env`, then re-run the up script so compose and SmileCDR properties regenerate.
 
-Edit that file (or `.env.example` before the first run), then run the script again so compose and SmileCDR properties are regenerated.
+### `config.env` settings
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -68,7 +75,13 @@ Edit that file (or `.env.example` before the first run), then run the script aga
 | `DB_CDR_NAME` / `DB_CDR_USER` / `DB_CDR_PASSWORD` | `cdr` / `cdr` / `SmileCDR` | Application DB |
 | `SMILECDR_PLATFORM` | `linux/amd64` | Compose `platform` for Releases-site images |
 
-Credentials in `.env.example` are for local development only.
+### `.env` secrets
+
+| Variable | Purpose |
+|----------|---------|
+| `SMILE_LICENSE_KEY` | SmileCDR License Manager JWT (`module.license.config.jwt_text`). Leave empty if you are not using premium modules that require a key. |
+
+The stack injects `SMILE_LICENSE_KEY` into the SmileCDR container. The patched properties file reads it with Smile’s `#{env['SMILE_LICENSE_KEY']}` substitution.
 
 ## Script options
 
@@ -107,11 +120,11 @@ docker ps
 .\scripts\smile-postgres-up.ps1 -Down
 ```
 
-Generated runtime files under `.runtime/` are gitignored.
+Generated runtime files under `.runtime/` are gitignored. Do not commit `.env`.
 
 ## ARM64 note
 
-Images from the Smile Releases site are **AMD64**. The compose file sets `platform: linux/amd64` (overridable via `SMILECDR_PLATFORM`).
+Images from the Smile Releases site are **AMD64**. The compose file sets `platform: linux/amd64` (overridable via `SMILECDR_PLATFORM` in `config.env`).
 
 On Apple Silicon, Docker Desktop can run that image via emulation. For a native ARM64 image, pull from Smile’s registry instead of using a Downloads tarball:
 
@@ -130,21 +143,24 @@ Then retag or adjust the generated Dockerfile `FROM` / compose image and set `SM
 | `Docker is not running` | Start Docker Desktop; confirm `docker info` works |
 | SmileCDR exits / H2 errors | Confirm `.runtime/.../cdr-config-Master.properties` has `POSTGRES_9_4` and URL host `postgresdb` |
 | Postgres never healthy | `docker logs postgres_cdr-<version>`; ensure host port `POSTGRES_HOST_PORT` is free |
-| Port already allocated | Change ports in the runtime `.env` and re-run the up script (common if another SmileCDR stack is already bound to 8000/9100/…) |
+| Port already allocated | Change ports in `config.env` and re-run the up script (common if another SmileCDR stack is already bound to 8000/9100/…) |
 | Postgres 18 volume errors about `/var/lib/postgresql/data` | This stack mounts `/var/lib/postgresql` (required for Postgres 18+). Run with `-Down` / `--down`, then `docker compose … down -v` if an old volume remains, and start again |
+| Premium module license errors | Set `SMILE_LICENSE_KEY` in `.env` and re-run (or restart) the stack |
 
 ## Layout
 
 ```
+config.env               # Non-secret ports and DB settings (committed)
+.env.example             # Template for secrets
+.env                     # Secrets only (gitignored)
 docker/
-  compose.template.yml   # Compose template (placeholders filled at runtime)
+  compose.template.yml
   Dockerfile.postgres
   Dockerfile.smilecdr
-  init_postgresdb.sh     # Creates cdr role/DB + Postgres 15+ grants
+  init_postgresdb.sh
 scripts/
   smile-postgres-up.sh
   smile-postgres-up.ps1
-.env.example
 ```
 
 ## Out of scope

@@ -6,7 +6,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOCKER_DIR="${REPO_ROOT}/docker"
+CONFIG_FILE="${REPO_ROOT}/config.env"
 ENV_EXAMPLE="${REPO_ROOT}/.env.example"
+SECRETS_FILE="${REPO_ROOT}/.env"
 
 DOWNLOADS_DIR="${HOME}/Downloads"
 TARBALL=""
@@ -227,6 +229,17 @@ patch_smile_config() {
   if grep -qE '^[[:space:]]*module\.fhir_endpoint\.config\.base_url\.fixed[[:space:]]*=' "$file"; then
     set_prop "$file" "module.fhir_endpoint.config.base_url.fixed" "http://localhost:${FHIR_PORT}"
   fi
+
+  # License JWT from container env (SMILE_LICENSE_KEY in repo-root .env).
+  set_prop "$file" "module.license.config.jwt_text" "#{env['SMILE_LICENSE_KEY']}"
+}
+
+# Compose env-file args: non-secret config.env, then secrets .env (overrides).
+compose_env_file_args() {
+  printf '%s\n' --env-file "$CONFIG_FILE"
+  if [[ -f "$SECRETS_FILE" ]]; then
+    printf '%s\n' --env-file "$SECRETS_FILE"
+  fi
 }
 
 extract_config_from_image() {
@@ -269,13 +282,18 @@ COMPOSE_FILE="${RUNTIME_DIR}/docker-compose.yml"
 SAFE_VERSION="$(printf '%s' "${SMILE_VERSION//./-}" | tr '[:upper:]' '[:lower:]')"
 PROJECT_NAME="${PROJECT_HINT:-smilecdr-${SAFE_VERSION}}"
 
-# Seed env defaults
 mkdir -p "$RUNTIME_DIR"
-if [[ ! -f "${RUNTIME_DIR}/.env" ]]; then
+
+[[ -f "$CONFIG_FILE" ]] || die "missing ${CONFIG_FILE}"
+if [[ ! -f "$SECRETS_FILE" ]]; then
   [[ -f "$ENV_EXAMPLE" ]] || die "missing ${ENV_EXAMPLE}"
-  cp "$ENV_EXAMPLE" "${RUNTIME_DIR}/.env"
+  cp "$ENV_EXAMPLE" "$SECRETS_FILE"
+  echo "Created ${SECRETS_FILE} from .env.example — set SMILE_LICENSE_KEY if you need premium modules."
 fi
-load_env_file "${RUNTIME_DIR}/.env"
+# Non-secret settings first; .env secrets override on name collision.
+load_env_file "$CONFIG_FILE"
+load_env_file "$SECRETS_FILE"
+mapfile -t COMPOSE_ENV_ARGS < <(compose_env_file_args)
 
 POSTGRES_MAJOR="${POSTGRES_MAJOR:-17}"
 SMILECDR_PLATFORM="${SMILECDR_PLATFORM:-linux/amd64}"
@@ -309,10 +327,10 @@ if [[ "$DO_DOWN" -eq 1 ]]; then
     die "no generated compose file at ${COMPOSE_FILE}; run without --down first"
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] would run: docker compose -f ${COMPOSE_FILE} --project-name ${PROJECT_NAME} --env-file ${RUNTIME_DIR}/.env down"
+    echo "[dry-run] would run: docker compose -f ${COMPOSE_FILE} --project-name ${PROJECT_NAME} ${COMPOSE_ENV_ARGS[*]} down"
     exit 0
   fi
-  docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" --env-file "${RUNTIME_DIR}/.env" down
+  docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" down
   echo "Stack stopped."
   exit 0
 fi
@@ -360,7 +378,7 @@ render_compose \
   "$SMILECDR_PLATFORM"
 
 echo "Starting stack..."
-docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" --env-file "${RUNTIME_DIR}/.env" up -d --build
+docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" up -d --build
 
 cat <<EOF
 

@@ -40,6 +40,8 @@ services:
     depends_on:
       postgresdb:
         condition: service_healthy
+    environment:
+      SMILE_LICENSE_KEY: ${SMILE_LICENSE_KEY:-}
     ports:
       - "${FHIR_PORT}:${FHIR_PORT}"
       - "${FHIRWEB_PORT}:${FHIRWEB_PORT}"
