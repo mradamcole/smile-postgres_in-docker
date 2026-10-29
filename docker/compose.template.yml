@@ -1,0 +1,62 @@
+services:
+  postgresdb:
+    container_name: postgres_cdr-__SMILECDR_VERSION__
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+      args:
+        POSTGRES_TAG: __POSTGRES_TAG__
+    image: postgres_cdr:__POSTGRES_TAG__
+    ports:
+      - "${POSTGRES_HOST_PORT}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: postgres
+      CDR_DB_NAME: ${DB_CDR_NAME}
+      CDR_USER: ${DB_CDR_USER}
+      CDR_PASSWORD: ${DB_CDR_PASSWORD}
+    volumes:
+      # Postgres 18+ expects the mount at /var/lib/postgresql (not .../data).
+      # Older majors still persist PGDATA under this path.
+      - db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  smilecdr:
+    container_name: smilecdr-__SMILECDR_VERSION__
+    platform: __SMILECDR_PLATFORM__
+    build:
+      context: .
+      dockerfile: Dockerfile.smilecdr
+      args:
+        SMILECDR_IMAGE: smilecdr:__SMILECDR_VERSION__
+    image: smilecdr_pg:__SMILECDR_VERSION__
+    depends_on:
+      postgresdb:
+        condition: service_healthy
+    ports:
+      - "${FHIR_PORT}:${FHIR_PORT}"
+      - "${FHIRWEB_PORT}:${FHIRWEB_PORT}"
+      - "${ADMIN_JSON_PORT}:${ADMIN_JSON_PORT}"
+      - "${ADMIN_WEB_PORT}:${ADMIN_WEB_PORT}"
+      - "${SMART_AUTH_PORT}:${SMART_AUTH_PORT}"
+      - "${SMART_DEMO_PORT}:${SMART_DEMO_PORT}"
+    volumes:
+      - log:/home/smile/smilecdr/log
+      - mq:/home/smile/smilecdr/activemq-data
+      - lucene:/home/smile/smilecdr/database/lucene_fhir_persistence
+      - tmp:/home/smile/smilecdr/tmp
+    restart: unless-stopped
+
+volumes:
+  db:
+  mq:
+  log:
+  lucene:
+  tmp:

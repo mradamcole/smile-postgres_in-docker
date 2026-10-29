@@ -1,0 +1,8 @@
+.runtime/
+.env
+*.log
+smile.log
+*.tar.gz
+*.tar.bz2
+.DS_Store
+Thumbs.db

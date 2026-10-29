@@ -1,0 +1,19 @@
+# SMILECDR_IMAGE is substituted at runtime (e.g. smilecdr:2026.08.R02).
+ARG SMILECDR_IMAGE=smilecdr:latest
+FROM ${SMILECDR_IMAGE}
+
+RUN mkdir -p /home/smile/smilecdr/activemq-data \
+    /home/smile/smilecdr/database \
+    /home/smile/smilecdr/log \
+    /home/smile/smilecdr/tmp \
+ && chown -R smile:smile /home/smile/smilecdr/activemq-data \
+    /home/smile/smilecdr/database \
+    /home/smile/smilecdr/log \
+    /home/smile/smilecdr/tmp \
+ && chmod 775 /home/smile/smilecdr/activemq-data \
+    /home/smile/smilecdr/database \
+    /home/smile/smilecdr/log \
+    /home/smile/smilecdr/tmp
+
+WORKDIR /home/smile/smilecdr/classes
+COPY cdr-config-Master.properties ./cdr-config-Master.properties

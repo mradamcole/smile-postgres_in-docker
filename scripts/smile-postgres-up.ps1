@@ -1,0 +1,410 @@
+# Find the newest SmileCDR Docker tarball in Downloads, load it, and start
+# SmileCDR + PostgreSQL with Postgres as the default database.
+[CmdletBinding()]
+param(
+    [string]$DownloadsDir = "",
+    [string]$Tarball = "",
+    [switch]$DryRun,
+    [switch]$Down,
+    [switch]$ForceLoad,
+    [string]$Project = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Resolve-Path (Join-Path $ScriptDir "..")
+$DockerDir = Join-Path $RepoRoot "docker"
+$EnvExample = Join-Path $RepoRoot ".env.example"
+
+if (-not $DownloadsDir) {
+    $DownloadsDir = Join-Path $env:USERPROFILE "Downloads"
+}
+
+function Write-ErrExit([string]$Message) {
+    [Console]::Error.WriteLine("error: $Message")
+    exit 1
+}
+
+function Write-TextFile([string]$Path, [string]$Content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+}
+
+function Invoke-Docker([string[]]$DockerArgs) {
+    # Pass args as an array (Invoke-Docker @('compose','-f',...)) so switches like
+    # -f / -d are not bound as PowerShell parameters.
+    # Write-Host keeps docker stdout off the success pipeline so callers can
+    # capture only the exit code with $code = Invoke-Docker ...
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & docker @DockerArgs 2>&1 | ForEach-Object {
+        Write-Host $_
+    }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    return $code
+}
+
+function Write-TextLines([string]$Path, [string[]]$Lines) {
+    $content = ($Lines -join "`n") + "`n"
+    Write-TextFile -Path $Path -Content $content
+}
+
+function Test-Command([string]$Name) {
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-VersionFromName([string]$Name) {
+    if ($Name -match '^smilecdr-(\d{4}\.\d{2}\.R\d+)-(docker\.tar\.gz|image\.tar\.bz2)$') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-VersionSortKey([string]$Version) {
+    if ($Version -match '^(\d{4})\.(\d{2})\.R(\d+)$') {
+        return ([int]$Matches[1] * 1000000) + ([int]$Matches[2] * 1000) + [int]$Matches[3]
+    }
+    return 0
+}
+
+function Find-LatestTarball([string]$Dir) {
+    if (-not (Test-Path -LiteralPath $Dir)) {
+        Write-ErrExit "downloads directory not found: $Dir"
+    }
+
+    $candidates = @()
+    $candidates += Get-ChildItem -LiteralPath $Dir -File -Filter "smilecdr-*-docker.tar.gz" -ErrorAction SilentlyContinue
+    $candidates += Get-ChildItem -LiteralPath $Dir -File -Filter "smilecdr-*-image.tar.bz2" -ErrorAction SilentlyContinue
+
+    $best = $null
+    $bestKey = -1
+    $bestVersion = $null
+
+    foreach ($f in $candidates) {
+        $ver = Get-VersionFromName $f.Name
+        if (-not $ver) { continue }
+        $key = Get-VersionSortKey $ver
+        if ($key -gt $bestKey) {
+            $bestKey = $key
+            $best = $f.FullName
+            $bestVersion = $ver
+        }
+    }
+
+    if (-not $best) {
+        Write-ErrExit "no SmileCDR tarball found in $Dir (expected smilecdr-YYYY.MM.RXX-docker.tar.gz)"
+    }
+
+    return @{ Path = $best; Version = $bestVersion }
+}
+
+function Resolve-PostgresMajor([int]$Fallback = 17) {
+    # Probe descending majors; Hub "last_updated" pages miss older major tags.
+    foreach ($major in @(20, 19, 18, 17, 16, 15, 14)) {
+        try {
+            $uri = "https://hub.docker.com/v2/repositories/library/postgres/tags/${major}-alpine"
+            Invoke-RestMethod -Uri $uri -TimeoutSec 10 | Out-Null
+            return $major
+        }
+        catch {
+            # try next major
+        }
+    }
+    return $Fallback
+}
+
+function Test-DockerImage([string]$Image) {
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    docker image inspect $Image 1>$null 2>$null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    return ($code -eq 0)
+}
+
+function Import-DotEnv([string]$Path) {
+    $map = @{}
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#")) { return }
+        $idx = $line.IndexOf("=")
+        if ($idx -lt 1) { return }
+        $key = $line.Substring(0, $idx).Trim()
+        $value = $line.Substring($idx + 1).Trim()
+        $map[$key] = $value
+        Set-Item -Path "Env:$key" -Value $value
+    }
+    return $map
+}
+
+function Set-Prop([string]$File, [string]$Key, [string]$Value) {
+    $lines = Get-Content -LiteralPath $File
+    $found = $false
+    $out = foreach ($line in $lines) {
+        if ($line -match '^\s*([^=\s]+)\s*=') {
+            $k = $Matches[1]
+            if ($k -eq $Key) {
+                $prefix = ($line -split '=', 2)[0]
+                $found = $true
+                "$prefix=$Value"
+                continue
+            }
+        }
+        $line
+    }
+    if (-not $found) {
+        $out += "$Key=$Value"
+    }
+    Write-TextLines -Path $File -Lines @($out)
+}
+
+function Update-SmileConfig {
+    param(
+        [string]$File,
+        [string]$DbName,
+        [string]$DbUser,
+        [string]$DbPassword,
+        [hashtable]$Ports
+    )
+
+    $jdbc = "jdbc:postgresql://postgresdb:5432/$DbName"
+    Set-Prop $File "module.clustermgr.config.db.driver" "POSTGRES_9_4"
+    Set-Prop $File "module.persistence.config.db.driver" "POSTGRES_9_4"
+    Set-Prop $File "module.clustermgr.config.db.url" $jdbc
+    Set-Prop $File "module.persistence.config.db.url" $jdbc
+    Set-Prop $File "module.clustermgr.config.db.username" $DbUser
+    Set-Prop $File "module.clustermgr.config.db.password" $DbPassword
+    Set-Prop $File "module.persistence.config.db.username" $DbUser
+    Set-Prop $File "module.persistence.config.db.password" $DbPassword
+
+    Set-Prop $File "module.fhir_endpoint.config.port" $Ports.FHIR_PORT
+    Set-Prop $File "module.fhirweb_endpoint.config.port" $Ports.FHIRWEB_PORT
+    Set-Prop $File "module.admin_json.config.port" $Ports.ADMIN_JSON_PORT
+    Set-Prop $File "module.admin_web.config.port" $Ports.ADMIN_WEB_PORT
+    Set-Prop $File "module.smart_auth.config.port" $Ports.SMART_AUTH_PORT
+    Set-Prop $File "module.smart_app_demo_host.config.port" $Ports.SMART_DEMO_PORT
+
+    $raw = Get-Content -LiteralPath $File -Raw
+    if ($raw -match '(?m)^\s*module\.fhir_endpoint\.config\.base_url\.fixed\s*=') {
+        Set-Prop $File "module.fhir_endpoint.config.base_url.fixed" "http://localhost:$($Ports.FHIR_PORT)"
+    }
+}
+
+function Expand-ComposeTemplate {
+    param(
+        [string]$Template,
+        [string]$OutFile,
+        [string]$Version,
+        [string]$PostgresTag,
+        [string]$Platform
+    )
+    $content = Get-Content -LiteralPath $Template -Raw
+    $content = $content.Replace("__SMILECDR_VERSION__", $Version)
+    $content = $content.Replace("__POSTGRES_TAG__", $PostgresTag)
+    $content = $content.Replace("__SMILECDR_PLATFORM__", $Platform)
+    Write-TextFile -Path $OutFile -Content $content
+}
+
+function Get-ConfigFromImage([string]$Image, [string]$Dest) {
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $cid = (& docker create $Image 2>$null | Out-String).Trim()
+    $ErrorActionPreference = $prevEap
+    if (-not $cid) {
+        Write-ErrExit "failed to create temporary container from $Image"
+    }
+    try {
+        $code = Invoke-Docker @(
+            "cp",
+            "${cid}:/home/smile/smilecdr/classes/cdr-config-Master.properties",
+            $Dest
+        )
+        if ($code -ne 0) {
+            Write-ErrExit "failed to extract cdr-config-Master.properties from $Image"
+        }
+    }
+    finally {
+        [void](Invoke-Docker @("rm", "-f", $cid))
+    }
+}
+
+# --- Resolve tarball / version ---
+if ($Tarball) {
+    if (-not (Test-Path -LiteralPath $Tarball)) {
+        Write-ErrExit "tarball not found: $Tarball"
+    }
+    $SmileVersion = Get-VersionFromName ([IO.Path]::GetFileName($Tarball))
+    if (-not $SmileVersion) {
+        Write-ErrExit "cannot parse SmileCDR version from filename: $([IO.Path]::GetFileName($Tarball))"
+    }
+}
+else {
+    $found = Find-LatestTarball $DownloadsDir
+    $Tarball = $found.Path
+    $SmileVersion = $found.Version
+}
+
+$RuntimeDir = Join-Path $RepoRoot ".runtime\smilecdr-$SmileVersion"
+$ComposeFile = Join-Path $RuntimeDir "docker-compose.yml"
+# Compose project names: lowercase alphanumeric, hyphens, underscores only.
+$SafeVersion = ($SmileVersion -replace '\.', '-').ToLowerInvariant()
+$ProjectName = if ($Project) { $Project } else { "smilecdr-$SafeVersion" }
+
+New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
+$RuntimeEnv = Join-Path $RuntimeDir ".env"
+if (-not (Test-Path -LiteralPath $RuntimeEnv)) {
+    if (-not (Test-Path -LiteralPath $EnvExample)) {
+        Write-ErrExit "missing $EnvExample"
+    }
+    $envText = [System.IO.File]::ReadAllText($EnvExample) -replace "`r`n", "`n" -replace "`r", "`n"
+    Write-TextFile -Path $RuntimeEnv -Content $envText
+}
+
+Import-DotEnv $RuntimeEnv | Out-Null
+
+function Get-EnvOr([string]$Name, [string]$Default) {
+    $v = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($v)) { return $Default }
+    return $v
+}
+
+$PostgresMajorFallback = [int](Get-EnvOr "POSTGRES_MAJOR" "17")
+$SmilePlatform = Get-EnvOr "SMILECDR_PLATFORM" "linux/amd64"
+$FhirPort = Get-EnvOr "FHIR_PORT" "8000"
+$FhirWebPort = Get-EnvOr "FHIRWEB_PORT" "8001"
+$AdminJsonPort = Get-EnvOr "ADMIN_JSON_PORT" "9000"
+$AdminWebPort = Get-EnvOr "ADMIN_WEB_PORT" "9100"
+$SmartAuthPort = Get-EnvOr "SMART_AUTH_PORT" "9200"
+$SmartDemoPort = Get-EnvOr "SMART_DEMO_PORT" "9201"
+$PostgresHostPort = Get-EnvOr "POSTGRES_HOST_PORT" "5432"
+$DbCdrName = Get-EnvOr "DB_CDR_NAME" "cdr"
+$DbCdrUser = Get-EnvOr "DB_CDR_USER" "cdr"
+$DbCdrPassword = Get-EnvOr "DB_CDR_PASSWORD" "SmileCDR"
+
+$ResolvedMajor = Resolve-PostgresMajor -Fallback $PostgresMajorFallback
+$PostgresTag = "$ResolvedMajor-alpine"
+$ImageTag = "smilecdr:$SmileVersion"
+
+Write-Host "SmileCDR version:  $SmileVersion"
+Write-Host "Tarball:           $Tarball"
+Write-Host "Postgres image:    postgres:$PostgresTag"
+Write-Host "Runtime dir:       $RuntimeDir"
+Write-Host "Compose project:   $ProjectName"
+Write-Host "Platform:          $SmilePlatform"
+
+if ($Down) {
+    if (-not (Test-Command "docker")) {
+        Write-ErrExit "required command not found: docker"
+    }
+    if (-not (Test-Path -LiteralPath $ComposeFile)) {
+        Write-ErrExit "no generated compose file at $ComposeFile; run without -Down first"
+    }
+    if ($DryRun) {
+        Write-Host "[dry-run] would run: docker compose -f $ComposeFile --project-name $ProjectName --env-file $RuntimeEnv down"
+        exit 0
+    }
+    $code = Invoke-Docker @(
+        "compose", "-f", $ComposeFile,
+        "--project-name", $ProjectName,
+        "--env-file", $RuntimeEnv,
+        "down"
+    )
+    if ($code -ne 0) { exit $code }
+    Write-Host "Stack stopped."
+    exit 0
+}
+
+if ($DryRun) {
+    Write-Host "[dry-run] would load image, patch config, build, and start the stack."
+    exit 0
+}
+
+if (-not (Test-Command "docker")) {
+    Write-ErrExit "required command not found: docker"
+}
+
+# Native docker.exe writes warnings to stderr; do not treat those as terminating errors.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+docker info 1>$null 2>$null
+$dockerInfoExit = $LASTEXITCODE
+$ErrorActionPreference = $prevEap
+if ($dockerInfoExit -ne 0) {
+    Write-ErrExit "Docker is not running (docker info failed)"
+}
+
+if ($ForceLoad -or -not (Test-DockerImage $ImageTag)) {
+    Write-Host "Loading Docker image from tarball (this can take several minutes)..."
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $loadOut = & docker image load --input $Tarball 2>&1 | Out-String
+    $loadExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    Write-Host $loadOut
+    if ($loadExit -ne 0 -or -not (Test-DockerImage $ImageTag)) {
+        Write-ErrExit "image $ImageTag not present after load"
+    }
+}
+else {
+    Write-Host "Image $ImageTag already present (use -ForceLoad to reload)."
+}
+
+Copy-Item -LiteralPath (Join-Path $DockerDir "init_postgresdb.sh") -Destination (Join-Path $RuntimeDir "init_postgresdb.sh") -Force
+Copy-Item -LiteralPath (Join-Path $DockerDir "Dockerfile.postgres") -Destination (Join-Path $RuntimeDir "Dockerfile.postgres") -Force
+Copy-Item -LiteralPath (Join-Path $DockerDir "Dockerfile.smilecdr") -Destination (Join-Path $RuntimeDir "Dockerfile.smilecdr") -Force
+
+$dfPg = Get-Content -LiteralPath (Join-Path $RuntimeDir "Dockerfile.postgres") -Raw
+$dfPg = $dfPg -replace 'ARG POSTGRES_TAG=.*', "ARG POSTGRES_TAG=$PostgresTag"
+Write-TextFile -Path (Join-Path $RuntimeDir "Dockerfile.postgres") -Content $dfPg
+
+$dfSm = Get-Content -LiteralPath (Join-Path $RuntimeDir "Dockerfile.smilecdr") -Raw
+$dfSm = $dfSm -replace 'ARG SMILECDR_IMAGE=.*', "ARG SMILECDR_IMAGE=$ImageTag"
+Write-TextFile -Path (Join-Path $RuntimeDir "Dockerfile.smilecdr") -Content $dfSm
+
+$ConfigPath = Join-Path $RuntimeDir "cdr-config-Master.properties"
+Write-Host "Extracting default cdr-config-Master.properties from $ImageTag..."
+Get-ConfigFromImage -Image $ImageTag -Dest $ConfigPath
+
+$ports = @{
+    FHIR_PORT       = $FhirPort
+    FHIRWEB_PORT    = $FhirWebPort
+    ADMIN_JSON_PORT = $AdminJsonPort
+    ADMIN_WEB_PORT  = $AdminWebPort
+    SMART_AUTH_PORT = $SmartAuthPort
+    SMART_DEMO_PORT = $SmartDemoPort
+}
+Update-SmileConfig -File $ConfigPath -DbName $DbCdrName -DbUser $DbCdrUser -DbPassword $DbCdrPassword -Ports $ports
+
+Expand-ComposeTemplate `
+    -Template (Join-Path $DockerDir "compose.template.yml") `
+    -OutFile $ComposeFile `
+    -Version $SmileVersion `
+    -PostgresTag $PostgresTag `
+    -Platform $SmilePlatform
+
+Write-Host "Starting stack..."
+$upCode = Invoke-Docker @(
+    "compose", "-f", $ComposeFile,
+    "--project-name", $ProjectName,
+    "--env-file", $RuntimeEnv,
+    "up", "-d", "--build"
+)
+if ($upCode -ne 0) { exit $upCode }
+
+Write-Host @"
+
+Stack is starting.
+
+  Admin Web UI:  http://localhost:${AdminWebPort}  (default admin / password)
+  FHIR endpoint: http://localhost:${FhirPort}
+  FHIRWeb:       http://localhost:${FhirWebPort}
+  Postgres:      localhost:${PostgresHostPort}  (db/user ${DbCdrName}/${DbCdrUser})
+
+Follow SmileCDR logs:
+  docker logs -f smilecdr-${SmileVersion}
+
+Stop the stack:
+  powershell -File `"$($MyInvocation.MyCommand.Path)`" -Tarball `"$Tarball`" -Down
+"@
