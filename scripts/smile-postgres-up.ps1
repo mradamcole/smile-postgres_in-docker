@@ -7,6 +7,7 @@ param(
     [switch]$DryRun,
     [switch]$Down,
     [switch]$ForceLoad,
+    [switch]$UpdatePorts,
     [string]$Project = ""
 )
 
@@ -205,6 +206,98 @@ function Get-ComposeEnvFileArgs {
     return [string[]]$argsList
 }
 
+function Test-HostBindBlocked([int]$Port) {
+    # Secondary check for non-Docker listeners. On Windows + Docker Desktop,
+    # published container ports often do NOT block TcpListener, so Docker
+    # publish maps are checked separately.
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $Port)
+    try {
+        $listener.Start()
+        $listener.Stop()
+        return $false
+    }
+    catch {
+        return $true
+    }
+    finally {
+        try { $listener.Stop() } catch { }
+    }
+}
+
+function Find-DockerPortHolder([int]$Port) {
+    # Match host publish forms: 0.0.0.0:8000->... and 0.0.0.0:8000-8002->...
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $lines = & docker ps --format "{{.Names}}`t{{.Ports}}" 2>$null
+    $ErrorActionPreference = $prevEap
+    if (-not $lines) { return $null }
+
+    foreach ($line in $lines) {
+        $parts = $line -split "`t", 2
+        if ($parts.Count -lt 2) { continue }
+        $name = $parts[0]
+        $ports = $parts[1]
+        $matches = [regex]::Matches($ports, '(?:0\.0\.0\.0|127\.0\.0\.1|\[::\]):(\d+)(?:-(\d+))?->')
+        foreach ($m in $matches) {
+            $start = [int]$m.Groups[1].Value
+            $end = if ($m.Groups[2].Success) { [int]$m.Groups[2].Value } else { $start }
+            if ($Port -ge $start -and $Port -le $end) {
+                return $name
+            }
+        }
+    }
+    return $null
+}
+
+function Test-PortHeldByOurStack {
+    param(
+        [string]$Holder,
+        [string]$SmileVersion
+    )
+    if (-not $Holder) { return $false }
+    return ($Holder -eq "smilecdr-$SmileVersion" -or $Holder -eq "postgres_cdr-$SmileVersion")
+}
+
+function Assert-HostPortsAvailable {
+    param(
+        [hashtable]$PortMap,
+        [string]$SmileVersion,
+        [string]$ConfigPath
+    )
+
+    $busy = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    foreach ($name in @($PortMap.Keys | Sort-Object)) {
+        $port = [int]$PortMap[$name]
+        if ($seen.ContainsKey($port)) { continue }
+        $seen[$port] = $true
+
+        $dockerHolder = Find-DockerPortHolder -Port $port
+        if ($dockerHolder) {
+            if (Test-PortHeldByOurStack -Holder $dockerHolder -SmileVersion $SmileVersion) {
+                continue
+            }
+            [void]$busy.Add("${name}=${port} (Docker container: ${dockerHolder})")
+            continue
+        }
+
+        if (Test-HostBindBlocked -Port $port) {
+            [void]$busy.Add("${name}=${port} (in use on this host)")
+        }
+    }
+
+    if ($busy.Count -eq 0) { return }
+
+    [Console]::Error.WriteLine("warning: one or more host ports from config.env are already in use:")
+    foreach ($detail in $busy) {
+        [Console]::Error.WriteLine("  - $detail")
+    }
+    [Console]::Error.WriteLine("Edit $ConfigPath, choose free ports, then re-run this script.")
+    [Console]::Error.WriteLine("Tip: ports already used by smilecdr-$SmileVersion / postgres_cdr-$SmileVersion are ignored (stack refresh).")
+    exit 1
+}
+
 function Expand-ComposeTemplate {
     param(
         [string]$Template,
@@ -218,6 +311,56 @@ function Expand-ComposeTemplate {
     $content = $content.Replace("__POSTGRES_TAG__", $PostgresTag)
     $content = $content.Replace("__SMILECDR_PLATFORM__", $Platform)
     Write-TextFile -Path $OutFile -Content $content
+}
+
+function Get-PostgresTagFromCompose([string]$ComposePath) {
+    if (-not (Test-Path -LiteralPath $ComposePath)) { return $null }
+    foreach ($line in Get-Content -LiteralPath $ComposePath) {
+        if ($line -match '^\s*image:\s*postgres_cdr:(\S+)') {
+            return $Matches[1]
+        }
+    }
+    return $null
+}
+
+function Invoke-PortUpdates {
+    param(
+        [string]$ConfigPath,
+        [string]$ComposePath,
+        [string]$PostgresTag,
+        [string]$ProjectName,
+        [string[]]$ComposeEnvArgs,
+        [hashtable]$Ports,
+        [string]$DbName,
+        [string]$DbUser,
+        [string]$DbPassword,
+        [string]$SmileVersion,
+        [string]$Platform,
+        [string]$TemplatePath
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        Write-ErrExit "missing $ConfigPath; run without -UpdatePorts first"
+    }
+    if (-not (Test-Path -LiteralPath $ComposePath)) {
+        Write-ErrExit "missing $ComposePath; run without -UpdatePorts first"
+    }
+
+    Update-SmileConfig -File $ConfigPath -DbName $DbName -DbUser $DbUser -DbPassword $DbPassword -Ports $Ports
+    Expand-ComposeTemplate -Template $TemplatePath -OutFile $ComposePath -Version $SmileVersion -PostgresTag $PostgresTag -Platform $Platform
+
+    Write-Host "Applying port changes (volumes unchanged; containers recreated only if publish mappings changed)..."
+    $buildCode = Invoke-Docker (@(
+        "compose", "-f", $ComposePath,
+        "--project-name", $ProjectName
+    ) + $ComposeEnvArgs + @("build", "smilecdr"))
+    if ($buildCode -ne 0) { exit $buildCode }
+
+    $upCode = Invoke-Docker (@(
+        "compose", "-f", $ComposePath,
+        "--project-name", $ProjectName
+    ) + $ComposeEnvArgs + @("up", "-d"))
+    if ($upCode -ne 0) { exit $upCode }
 }
 
 function Get-ConfigFromImage([string]$Image, [string]$Dest) {
@@ -314,6 +457,25 @@ Write-Host "Runtime dir:       $RuntimeDir"
 Write-Host "Compose project:   $ProjectName"
 Write-Host "Platform:          $SmilePlatform"
 
+if ($UpdatePorts -and $Down) {
+    Write-ErrExit "use either -UpdatePorts or -Down, not both"
+}
+if ($UpdatePorts -and $ForceLoad) {
+    Write-ErrExit "use either -UpdatePorts or -ForceLoad, not both"
+}
+
+if (-not $Down) {
+    Assert-HostPortsAvailable -PortMap @{
+        FHIR_PORT           = $FhirPort
+        FHIRWEB_PORT        = $FhirWebPort
+        ADMIN_JSON_PORT     = $AdminJsonPort
+        ADMIN_WEB_PORT      = $AdminWebPort
+        SMART_AUTH_PORT     = $SmartAuthPort
+        SMART_DEMO_PORT     = $SmartDemoPort
+        POSTGRES_HOST_PORT  = $PostgresHostPort
+    } -SmileVersion $SmileVersion -ConfigPath $ConfigFile
+}
+
 if ($Down) {
     if (-not (Test-Command "docker")) {
         Write-ErrExit "required command not found: docker"
@@ -331,6 +493,65 @@ if ($Down) {
     ) + $ComposeEnvArgs + @("down"))
     if ($code -ne 0) { exit $code }
     Write-Host "Stack stopped."
+    exit 0
+}
+
+if ($UpdatePorts) {
+    $ConfigPath = Join-Path $RuntimeDir "cdr-config-Master.properties"
+    $postgresTagFromCompose = Get-PostgresTagFromCompose -ComposePath $ComposeFile
+    if (-not $postgresTagFromCompose) {
+        Write-ErrExit "cannot read Postgres tag from $ComposeFile; run a full up first"
+    }
+    if ($DryRun) {
+        Write-Host "[dry-run] would patch $ConfigPath, regenerate compose, build smilecdr, and docker compose up -d"
+        exit 0
+    }
+    if (-not (Test-Command "docker")) {
+        Write-ErrExit "required command not found: docker"
+    }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    docker info 1>$null 2>$null
+    $dockerInfoExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($dockerInfoExit -ne 0) {
+        Write-ErrExit "Docker is not running (docker info failed)"
+    }
+
+    $ports = @{
+        FHIR_PORT       = $FhirPort
+        FHIRWEB_PORT    = $FhirWebPort
+        ADMIN_JSON_PORT = $AdminJsonPort
+        ADMIN_WEB_PORT  = $AdminWebPort
+        SMART_AUTH_PORT = $SmartAuthPort
+        SMART_DEMO_PORT = $SmartDemoPort
+    }
+    Invoke-PortUpdates `
+        -ConfigPath $ConfigPath `
+        -ComposePath $ComposeFile `
+        -PostgresTag $postgresTagFromCompose `
+        -ProjectName $ProjectName `
+        -ComposeEnvArgs $ComposeEnvArgs `
+        -Ports $ports `
+        -DbName $DbCdrName `
+        -DbUser $DbCdrUser `
+        -DbPassword $DbCdrPassword `
+        -SmileVersion $SmileVersion `
+        -Platform $SmilePlatform `
+        -TemplatePath (Join-Path $DockerDir "compose.template.yml")
+
+    Write-Host @"
+
+Port settings from config.env are applied.
+
+  Admin Web UI:  http://localhost:${AdminWebPort}
+  FHIR endpoint: http://localhost:${FhirPort}
+  FHIRWeb:       http://localhost:${FhirWebPort}
+  Postgres:      localhost:${PostgresHostPort}
+
+Follow SmileCDR logs:
+  docker logs -f smilecdr-${SmileVersion}
+"@
     exit 0
 }
 

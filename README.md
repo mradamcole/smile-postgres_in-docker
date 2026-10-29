@@ -58,7 +58,7 @@ When SmileCDR finishes starting, logs should include `Smile, we're up and runnin
 | [`config.env`](config.env) | Yes | Ports, Postgres settings, DB names, platform |
 | [`.env`](.env) (from [`.env.example`](.env.example)) | No | Secrets only |
 
-Edit `config.env`, then re-run the up script so compose and SmileCDR properties regenerate.
+Edit `config.env`, then re-run the up script so compose and SmileCDR properties regenerate. To change ports only (keep database volumes and skip tarball reload), use `--update-ports` / `-UpdatePorts` after editing `config.env`.
 
 ### `config.env` settings
 
@@ -92,6 +92,7 @@ The stack injects `SMILE_LICENSE_KEY` into the SmileCDR container. The patched p
 .\scripts\smile-postgres-up.ps1 -Tarball "C:\Users\you\Downloads\smilecdr-2026.08.R02-docker.tar.gz"
 .\scripts\smile-postgres-up.ps1 -DryRun
 .\scripts\smile-postgres-up.ps1 -ForceLoad
+.\scripts\smile-postgres-up.ps1 -UpdatePorts
 .\scripts\smile-postgres-up.ps1 -Down
 ```
 
@@ -102,8 +103,11 @@ The stack injects `SMILE_LICENSE_KEY` into the SmileCDR container. The patched p
 ./scripts/smile-postgres-up.sh --tarball ~/Downloads/smilecdr-2026.08.R02-docker.tar.gz
 ./scripts/smile-postgres-up.sh --dry-run
 ./scripts/smile-postgres-up.sh --force-load
+./scripts/smile-postgres-up.sh --update-ports
 ./scripts/smile-postgres-up.sh --down
 ```
+
+`-UpdatePorts` / `--update-ports` patches the existing `.runtime/.../cdr-config-Master.properties`, regenerates `docker-compose.yml` from `config.env`, rebuilds the SmileCDR service image (ports are baked in at build time), and runs `docker compose up -d`. Named volumes (Postgres data, Lucene, etc.) are kept. Docker may replace containers when host publish mappings change; it cannot remap ports on a running container in place.
 
 ## Useful commands
 
@@ -143,7 +147,7 @@ Then retag or adjust the generated Dockerfile `FROM` / compose image and set `SM
 | `Docker is not running` | Start Docker Desktop; confirm `docker info` works |
 | SmileCDR exits / H2 errors | Confirm `.runtime/.../cdr-config-Master.properties` has `POSTGRES_9_4` and URL host `postgresdb` |
 | Postgres never healthy | `docker logs postgres_cdr-<version>`; ensure host port `POSTGRES_HOST_PORT` is free |
-| Port already allocated | Change ports in `config.env` and re-run the up script (common if another SmileCDR stack is already bound to 8000/9100/…) |
+| Port already allocated | The up script checks host ports from `config.env` before starting and exits with a warning listing busy ports (and Docker container names when known). Edit `config.env` and re-run. Ports already held by this stack’s own containers are allowed so refreshes still work. |
 | Postgres 18 volume errors about `/var/lib/postgresql/data` | This stack mounts `/var/lib/postgresql` (required for Postgres 18+). Run with `-Down` / `--down`, then `docker compose … down -v` if an old volume remains, and start again |
 | Premium module license errors | Set `SMILE_LICENSE_KEY` in `.env` and re-run (or restart) the stack |
 

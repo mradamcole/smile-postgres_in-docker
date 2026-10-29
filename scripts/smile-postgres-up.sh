@@ -15,6 +15,7 @@ TARBALL=""
 DRY_RUN=0
 DO_DOWN=0
 FORCE_LOAD=0
+UPDATE_PORTS=0
 PROJECT_HINT=""
 
 usage() {
@@ -27,6 +28,7 @@ Options:
   --dry-run             Print choices and paths; do not run docker
   --down                Stop and remove the compose stack for the chosen version
   --force-load          Always docker image load even if the tag already exists
+  --update-ports        Reapply config.env ports to a running stack (no tarball reload)
   --project NAME        Compose project name override (default: smilecdr-<version>)
   -h, --help            Show this help
 EOF
@@ -63,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --force-load)
       FORCE_LOAD=1
+      shift
+      ;;
+    --update-ports)
+      UPDATE_PORTS=1
       shift
       ;;
     --project)
@@ -242,6 +248,119 @@ compose_env_file_args() {
   fi
 }
 
+# Return container name if Docker has published this host port (incl. ranges like 8000-8002).
+find_docker_port_holder() {
+  local port="$1"
+  local name ports
+  command -v docker >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r name ports; do
+    [[ -n "$name" && -n "$ports" ]] || continue
+    # shellcheck disable=SC2001
+    while IFS= read -r span; do
+      [[ -n "$span" ]] || continue
+      local start="${span%-*}"
+      local end="${span#*-}"
+      [[ "$end" =~ ^[0-9]+$ ]] || end="$start"
+      if [[ "$port" -ge "$start" && "$port" -le "$end" ]]; then
+        printf '%s\n' "$name"
+        return 0
+      fi
+    done < <(printf '%s\n' "$ports" | grep -oE '(0\.0\.0\.0|127\.0\.0\.1|\[::\]):[0-9]+(-[0-9]+)?->' \
+      | sed -E 's/.*:([0-9]+(-[0-9]+)?)->/\1/')
+  done < <(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null || true)
+  return 0
+}
+
+# Secondary check for non-Docker listeners (skip broken Windows Store python stubs).
+host_bind_blocked() {
+  local port="$1"
+  local py="" candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" -c "import socket" >/dev/null 2>&1; then
+        py="$(command -v "$candidate")"
+        break
+      fi
+    fi
+  done
+  if [[ -n "$py" ]]; then
+    "$py" - "$port" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+blocked = False
+try:
+    s.bind(("0.0.0.0", port))
+except OSError:
+    blocked = True
+finally:
+    s.close()
+sys.exit(0 if blocked else 1)
+PY
+    return $?
+  fi
+  if (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+port_held_by_our_stack() {
+  local holder="$1"
+  [[ -n "$holder" ]] || return 1
+  [[ "$holder" == "smilecdr-${SMILE_VERSION}" || "$holder" == "postgres_cdr-${SMILE_VERSION}" ]]
+}
+
+# Abort with a clear warning if config.env ports are taken by something else.
+assert_host_ports_available() {
+  local -a checks=(
+    "FHIR_PORT:${FHIR_PORT}"
+    "FHIRWEB_PORT:${FHIRWEB_PORT}"
+    "ADMIN_JSON_PORT:${ADMIN_JSON_PORT}"
+    "ADMIN_WEB_PORT:${ADMIN_WEB_PORT}"
+    "SMART_AUTH_PORT:${SMART_AUTH_PORT}"
+    "SMART_DEMO_PORT:${SMART_DEMO_PORT}"
+    "POSTGRES_HOST_PORT:${POSTGRES_HOST_PORT}"
+  )
+  local -a busy=()
+  local entry name port holder detail
+  local seen_ports=" "
+
+  for entry in "${checks[@]}"; do
+    name="${entry%%:*}"
+    port="${entry#*:}"
+    case "$seen_ports" in
+      *" $port "*) continue ;;
+    esac
+    seen_ports="${seen_ports}${port} "
+
+    holder="$(find_docker_port_holder "$port")"
+    if [[ -n "$holder" ]]; then
+      if port_held_by_our_stack "$holder"; then
+        continue
+      fi
+      busy+=("${name}=${port} (Docker container: ${holder})")
+      continue
+    fi
+
+    if host_bind_blocked "$port"; then
+      busy+=("${name}=${port} (in use on this host)")
+    fi
+  done
+
+  if [[ ${#busy[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo "warning: one or more host ports from config.env are already in use:" >&2
+  for detail in "${busy[@]}"; do
+    echo "  - ${detail}" >&2
+  done
+  echo "Edit ${CONFIG_FILE}, choose free ports, then re-run this script." >&2
+  echo "Tip: ports already used by smilecdr-${SMILE_VERSION} / postgres_cdr-${SMILE_VERSION} are ignored (stack refresh)." >&2
+  exit 1
+}
+
 extract_config_from_image() {
   local image="$1"
   local dest="$2"
@@ -265,6 +384,39 @@ render_compose() {
     -e "s/__POSTGRES_TAG__/${postgres_tag}/g" \
     -e "s/__SMILECDR_PLATFORM__/${platform}/g" \
     "$template" >"$out"
+}
+
+# Read postgres_cdr:TAG from an existing generated compose file (update-ports mode).
+postgres_tag_from_compose() {
+  local compose_file="$1"
+  local line tag
+  line="$(grep -E '^[[:space:]]*image:[[:space:]]*postgres_cdr:' "$compose_file" | head -n1 || true)"
+  [[ -n "$line" ]] || return 1
+  tag="${line#*postgres_cdr:}"
+  tag="${tag%%[[:space:]]*}"
+  [[ -n "$tag" ]] || return 1
+  printf '%s\n' "$tag"
+}
+
+apply_port_updates() {
+  local config_path="$1"
+  local compose_file="$2"
+  local postgres_tag="$3"
+
+  [[ -f "$config_path" ]] || die "missing ${config_path}; run without --update-ports first"
+  [[ -f "$compose_file" ]] || die "missing ${compose_file}; run without --update-ports first"
+
+  patch_smile_config "$config_path" "$DB_CDR_NAME" "$DB_CDR_USER" "$DB_CDR_PASSWORD"
+  render_compose \
+    "${DOCKER_DIR}/compose.template.yml" \
+    "$compose_file" \
+    "$SMILE_VERSION" \
+    "$postgres_tag" \
+    "$SMILECDR_PLATFORM"
+
+  echo "Applying port changes (volumes unchanged; containers recreated only if publish mappings changed)..."
+  docker compose -f "$compose_file" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" build smilecdr
+  docker compose -f "$compose_file" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" up -d
 }
 
 # --- Resolve tarball / version ---
@@ -321,6 +473,18 @@ echo "Runtime dir:       ${RUNTIME_DIR}"
 echo "Compose project:   ${PROJECT_NAME}"
 echo "Platform:          ${SMILECDR_PLATFORM}"
 
+if [[ "$DO_DOWN" -ne 1 ]]; then
+  assert_host_ports_available
+fi
+
+if [[ "$UPDATE_PORTS" -eq 1 && "$DO_DOWN" -eq 1 ]]; then
+  die "use either --update-ports or --down, not both"
+fi
+
+if [[ "$UPDATE_PORTS" -eq 1 && "$FORCE_LOAD" -eq 1 ]]; then
+  die "use either --update-ports or --force-load, not both"
+fi
+
 if [[ "$DO_DOWN" -eq 1 ]]; then
   require_cmd docker
   if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -332,6 +496,32 @@ if [[ "$DO_DOWN" -eq 1 ]]; then
   fi
   docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" down
   echo "Stack stopped."
+  exit 0
+fi
+
+if [[ "$UPDATE_PORTS" -eq 1 ]]; then
+  CONFIG_PATH="${RUNTIME_DIR}/cdr-config-Master.properties"
+  POSTGRES_TAG="$(postgres_tag_from_compose "$COMPOSE_FILE")" \
+    || die "cannot read Postgres tag from ${COMPOSE_FILE}; run a full up first"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "[dry-run] would patch ${CONFIG_PATH}, regenerate compose, build smilecdr, and docker compose up -d"
+    exit 0
+  fi
+  require_cmd docker
+  docker info >/dev/null 2>&1 || die "Docker is not running (docker info failed)"
+  apply_port_updates "$CONFIG_PATH" "$COMPOSE_FILE" "$POSTGRES_TAG"
+  cat <<EOF
+
+Port settings from config.env are applied.
+
+  Admin Web UI:  http://localhost:${ADMIN_WEB_PORT}
+  FHIR endpoint: http://localhost:${FHIR_PORT}
+  FHIRWeb:       http://localhost:${FHIRWEB_PORT}
+  Postgres:      localhost:${POSTGRES_HOST_PORT}
+
+Follow SmileCDR logs:
+  docker logs -f smilecdr-${SMILE_VERSION}
+EOF
   exit 0
 fi
 
