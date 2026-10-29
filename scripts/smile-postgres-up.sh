@@ -445,7 +445,10 @@ fi
 # Non-secret settings first; .env secrets override on name collision.
 load_env_file "$CONFIG_FILE"
 load_env_file "$SECRETS_FILE"
-mapfile -t COMPOSE_ENV_ARGS < <(compose_env_file_args)
+COMPOSE_ENV_ARGS=()
+while IFS= read -r line; do
+  COMPOSE_ENV_ARGS+=("$line")
+done < <(compose_env_file_args)
 
 POSTGRES_MAJOR="${POSTGRES_MAJOR:-17}"
 SMILECDR_PLATFORM="${SMILECDR_PLATFORM:-linux/amd64}"
