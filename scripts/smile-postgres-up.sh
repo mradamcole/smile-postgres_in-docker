@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Find the newest SmileCDR Docker tarball in Downloads, load it, and start
-# SmileCDR + PostgreSQL with Postgres as the default database.
+# Find the newest SmileCDR tarball in Downloads (binary .tar.gz or docker image),
+# build/start SmileCDR + PostgreSQL with Postgres as the default database.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -89,7 +89,7 @@ done
 # Parse SmileCDR version from a filename into YEAR MONTH RELEASE; print as sortable key.
 version_key_from_name() {
   local name="$1"
-  if [[ "$name" =~ smilecdr-([0-9]{4})\.([0-9]{2})\.R([0-9]+)-(docker\.tar\.gz|image\.tar\.bz2)$ ]]; then
+  if [[ "$name" =~ smilecdr-([0-9]{4})\.([0-9]{2})\.R([0-9]+)(\.tar\.gz|-(docker\.tar\.gz|image\.tar\.bz2))$ ]]; then
     # 10# avoids bash printf treating 08/09 as invalid octal
     printf '%04d%02d%04d\n' \
       "$((10#${BASH_REMATCH[1]}))" \
@@ -102,39 +102,72 @@ version_key_from_name() {
 
 version_from_name() {
   local name="$1"
-  if [[ "$name" =~ smilecdr-([0-9]{4}\.[0-9]{2}\.R[0-9]+)-(docker\.tar\.gz|image\.tar\.bz2)$ ]]; then
+  if [[ "$name" =~ smilecdr-([0-9]{4}\.[0-9]{2}\.R[0-9]+)(\.tar\.gz|-(docker\.tar\.gz|image\.tar\.bz2))$ ]]; then
     printf '%s\n' "${BASH_REMATCH[1]}"
     return 0
   fi
   return 1
 }
 
+install_mode_from_name() {
+  local name="$1"
+  if [[ "$name" =~ smilecdr-[0-9]{4}\.[0-9]{2}\.R[0-9]+\.tar\.gz$ ]]; then
+    printf '%s\n' binary
+  else
+    printf '%s\n' docker-image
+  fi
+}
+
 find_latest_tarball() {
   local dir="$1"
   [[ -d "$dir" ]] || die "downloads directory not found: $dir"
 
-  local best_key="" best_path="" best_ver=""
-  local f name key ver
+  local best_key="" best_path="" best_ver="" best_mode=""
+  local prefer_binary=0
+  local f name key ver mode host_arch
+
+  host_arch="$(uname -m)"
+  [[ "$host_arch" == "arm64" ]] && prefer_binary=1
 
   shopt -s nullglob
   for f in \
-    "${dir}"/smilecdr-*-docker.tar.gz \
+    "${dir}"/smilecdr-*.tar.gz \
     "${dir}"/smilecdr-*-image.tar.bz2
   do
     [[ -f "$f" ]] || continue
     name="$(basename "$f")"
     key="$(version_key_from_name "$name")" || continue
     ver="$(version_from_name "$name")" || continue
+    mode="$(install_mode_from_name "$name")"
     if [[ -z "$best_key" || "$key" > "$best_key" ]]; then
       best_key="$key"
       best_path="$f"
       best_ver="$ver"
+      best_mode="$mode"
+    elif [[ "$key" == "$best_key" ]]; then
+      if [[ "$prefer_binary" -eq 1 && "$mode" == "binary" ]]; then
+        best_path="$f"
+        best_ver="$ver"
+        best_mode="$mode"
+      elif [[ "$prefer_binary" -eq 0 && "$mode" == "docker-image" ]]; then
+        best_path="$f"
+        best_ver="$ver"
+        best_mode="$mode"
+      fi
     fi
   done
   shopt -u nullglob
 
-  [[ -n "$best_path" ]] || die "no SmileCDR tarball found in ${dir} (expected smilecdr-YYYY.MM.RXX-docker.tar.gz)"
-  printf '%s\t%s\n' "$best_path" "$best_ver"
+  [[ -n "$best_path" ]] || die "no SmileCDR tarball found in ${dir} (expected smilecdr-YYYY.MM.RXX.tar.gz or …-docker.tar.gz)"
+  printf '%s\t%s\t%s\n' "$best_path" "$best_ver" "$best_mode"
+}
+
+resolve_runtime_install_mode() {
+  if [[ -d "${RUNTIME_DIR}/smilecdr/bin" && -f "${RUNTIME_DIR}/smilecdr/bin/smilecdr" ]]; then
+    printf '%s\n' binary
+  else
+    printf '%s\n' docker-image
+  fi
 }
 
 # Highest stable major with a published {major}-alpine tag on Docker Hub.
@@ -379,11 +412,97 @@ render_compose() {
   local version="$3"
   local postgres_tag="$4"
   local platform="$5"
+  local install_mode="$6"
+  local service_image build_args_file partial
+
+  if [[ "$install_mode" == "binary" ]]; then
+    service_image="smilecdr:${version}-arm64"
+  else
+    service_image="smilecdr_pg:${version}"
+  fi
+
+  build_args_file="$(mktemp)"
+  if [[ "$install_mode" == "docker-image" ]]; then
+    cat >"$build_args_file" <<EOF
+      args:
+        SMILECDR_IMAGE: smilecdr:${version}
+EOF
+  fi
+
+  partial="$(mktemp)"
   sed \
-    -e "s/__SMILECDR_VERSION__/${version}/g" \
-    -e "s/__POSTGRES_TAG__/${postgres_tag}/g" \
-    -e "s/__SMILECDR_PLATFORM__/${platform}/g" \
-    "$template" >"$out"
+    -e "s|__SMILECDR_VERSION__|${version}|g" \
+    -e "s|__POSTGRES_TAG__|${postgres_tag}|g" \
+    -e "s|__SMILECDR_PLATFORM__|${platform}|g" \
+    -e "s|__SMILECDR_SERVICE_IMAGE__|${service_image}|g" \
+    "$template" >"$partial"
+
+  awk -v build_args_file="$build_args_file" '
+    /__SMILECDR_BUILD_ARGS__/ {
+      while ((getline line < build_args_file) > 0) {
+        print line
+      }
+      close(build_args_file)
+      next
+    }
+    { print }
+  ' "$partial" >"$out"
+  rm -f "$partial" "$build_args_file"
+}
+
+verify_smile_service_image() {
+  local install_mode="$1"
+  local inspect_tag arch
+  if [[ "$install_mode" != "binary" ]]; then
+    return 0
+  fi
+  inspect_tag="smilecdr:${SMILE_VERSION}-arm64"
+  arch="$(docker image inspect "$inspect_tag" --format '{{.Os}}/{{.Architecture}}')"
+  [[ "$arch" == "linux/arm64" ]] \
+    || die "expected linux/arm64 for ${inspect_tag}, got ${arch:-unknown}"
+  echo "SmileCDR image architecture: ${arch}"
+}
+
+materialize_postgres_build_context() {
+  cp "${DOCKER_DIR}/init_postgresdb.sh" "${RUNTIME_DIR}/init_postgresdb.sh"
+  cp "${DOCKER_DIR}/Dockerfile.postgres" "${RUNTIME_DIR}/Dockerfile.postgres"
+  sed -i.bak "s|ARG POSTGRES_TAG=.*|ARG POSTGRES_TAG=${POSTGRES_TAG}|" "${RUNTIME_DIR}/Dockerfile.postgres"
+  rm -f "${RUNTIME_DIR}/Dockerfile.postgres.bak"
+}
+
+materialize_binary_smile_context() {
+  echo "Extracting application from binary tarball..."
+  rm -rf "${RUNTIME_DIR}/smilecdr"
+  tar -xzf "$TARBALL" -C "$RUNTIME_DIR"
+  [[ -d "${RUNTIME_DIR}/smilecdr" ]] || die "expected smilecdr/ directory in ${TARBALL}"
+
+  CONFIG_PATH="${RUNTIME_DIR}/cdr-config-Master.properties"
+  cp "${RUNTIME_DIR}/smilecdr/classes/cdr-config-Master.properties" "$CONFIG_PATH"
+  patch_smile_config "$CONFIG_PATH" "$DB_CDR_NAME" "$DB_CDR_USER" "$DB_CDR_PASSWORD"
+
+  cp "${DOCKER_DIR}/Dockerfile.smilecdr.binary" "${RUNTIME_DIR}/Dockerfile.smilecdr"
+}
+
+materialize_docker_image_smile_context() {
+  if [[ "$FORCE_LOAD" -eq 1 ]] || ! image_exists "$IMAGE_TAG"; then
+    echo "Loading Docker image from tarball..."
+    load_out="$(docker image load --input "$TARBALL")"
+    echo "$load_out"
+    if ! printf '%s' "$load_out" | grep -qiE "Loaded image:.*smilecdr:${SMILE_VERSION}|Loaded image ID:"; then
+      image_exists "$IMAGE_TAG" || die "image ${IMAGE_TAG} not present after load"
+    fi
+  else
+    echo "Image ${IMAGE_TAG} already present (use --force-load to reload)."
+  fi
+
+  cp "${DOCKER_DIR}/Dockerfile.smilecdr" "${RUNTIME_DIR}/Dockerfile.smilecdr"
+  sed -i.bak "s|ARG SMILECDR_IMAGE=.*|ARG SMILECDR_IMAGE=${IMAGE_TAG}|" "${RUNTIME_DIR}/Dockerfile.smilecdr"
+  rm -f "${RUNTIME_DIR}/Dockerfile.smilecdr.bak"
+
+  CONFIG_PATH="${RUNTIME_DIR}/cdr-config-Master.properties"
+  echo "Extracting default cdr-config-Master.properties from ${IMAGE_TAG}..."
+  extract_config_from_image "$IMAGE_TAG" "$CONFIG_PATH"
+  patch_smile_config "$CONFIG_PATH" "$DB_CDR_NAME" "$DB_CDR_USER" "$DB_CDR_PASSWORD"
 }
 
 # Read postgres_cdr:TAG from an existing generated compose file (update-ports mode).
@@ -402,6 +521,8 @@ apply_port_updates() {
   local config_path="$1"
   local compose_file="$2"
   local postgres_tag="$3"
+  local install_mode
+  install_mode="$(resolve_runtime_install_mode)"
 
   [[ -f "$config_path" ]] || die "missing ${config_path}; run without --update-ports first"
   [[ -f "$compose_file" ]] || die "missing ${compose_file}; run without --update-ports first"
@@ -412,11 +533,13 @@ apply_port_updates() {
     "$compose_file" \
     "$SMILE_VERSION" \
     "$postgres_tag" \
-    "$SMILECDR_PLATFORM"
+    "$SMILECDR_PLATFORM" \
+    "$install_mode"
 
   echo "Applying port changes (volumes unchanged; containers recreated only if publish mappings changed)..."
   docker compose -f "$compose_file" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" build smilecdr
   docker compose -f "$compose_file" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" up -d
+  verify_smile_service_image "$install_mode"
 }
 
 # --- Resolve tarball / version ---
@@ -424,8 +547,9 @@ if [[ -n "$TARBALL" ]]; then
   [[ -f "$TARBALL" ]] || die "tarball not found: $TARBALL"
   SMILE_VERSION="$(version_from_name "$(basename "$TARBALL")")" \
     || die "cannot parse SmileCDR version from filename: $(basename "$TARBALL")"
+  INSTALL_MODE="$(install_mode_from_name "$(basename "$TARBALL")")"
 else
-  IFS=$'\t' read -r TARBALL SMILE_VERSION < <(find_latest_tarball "$DOWNLOADS_DIR")
+  IFS=$'\t' read -r TARBALL SMILE_VERSION INSTALL_MODE < <(find_latest_tarball "$DOWNLOADS_DIR")
 fi
 
 RUNTIME_DIR="${REPO_ROOT}/.runtime/smilecdr-${SMILE_VERSION}"
@@ -452,6 +576,9 @@ done < <(compose_env_file_args)
 
 POSTGRES_MAJOR="${POSTGRES_MAJOR:-17}"
 SMILECDR_PLATFORM="${SMILECDR_PLATFORM:-linux/amd64}"
+if [[ "$INSTALL_MODE" == "binary" ]]; then
+  SMILECDR_PLATFORM="linux/arm64"
+fi
 FHIR_PORT="${FHIR_PORT:-8000}"
 FHIRWEB_PORT="${FHIRWEB_PORT:-8001}"
 ADMIN_JSON_PORT="${ADMIN_JSON_PORT:-9000}"
@@ -470,11 +597,17 @@ POSTGRES_TAG="${RESOLVED_MAJOR}-alpine"
 IMAGE_TAG="smilecdr:${SMILE_VERSION}"
 
 echo "SmileCDR version:  ${SMILE_VERSION}"
+echo "Install mode:      ${INSTALL_MODE}"
 echo "Tarball:           ${TARBALL}"
 echo "Postgres image:    postgres:${POSTGRES_TAG}"
 echo "Runtime dir:       ${RUNTIME_DIR}"
 echo "Compose project:   ${PROJECT_NAME}"
 echo "Platform:          ${SMILECDR_PLATFORM}"
+if [[ "$INSTALL_MODE" == "binary" ]]; then
+  echo "SmileCDR image:    smilecdr:${SMILE_VERSION}-arm64"
+else
+  echo "SmileCDR image:    smilecdr_pg:${SMILE_VERSION}"
+fi
 
 if [[ "$DO_DOWN" -ne 1 ]]; then
   assert_host_ports_available
@@ -486,6 +619,10 @@ fi
 
 if [[ "$UPDATE_PORTS" -eq 1 && "$FORCE_LOAD" -eq 1 ]]; then
   die "use either --update-ports or --force-load, not both"
+fi
+
+if [[ "$FORCE_LOAD" -eq 1 && "$INSTALL_MODE" == "binary" ]]; then
+  die "--force-load applies to docker-image tarballs only"
 fi
 
 if [[ "$DO_DOWN" -eq 1 ]]; then
@@ -529,49 +666,35 @@ EOF
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[dry-run] would load image, patch config, build, and start the stack."
+  if [[ "$INSTALL_MODE" == "binary" ]]; then
+    echo "[dry-run] would extract binary tarball, build smilecdr:${SMILE_VERSION}-arm64, and start the stack."
+  else
+    echo "[dry-run] would load docker image, patch config, build, and start the stack."
+  fi
   exit 0
 fi
 
 require_cmd docker
 docker info >/dev/null 2>&1 || die "Docker is not running (docker info failed)"
 
-# Load image if needed
-if [[ "$FORCE_LOAD" -eq 1 ]] || ! image_exists "$IMAGE_TAG"; then
-  echo "Loading Docker image from tarball..."
-  load_out="$(docker image load --input "$TARBALL")"
-  echo "$load_out"
-  if ! printf '%s' "$load_out" | grep -qiE "Loaded image:.*smilecdr:${SMILE_VERSION}|Loaded image ID:"; then
-    # Some docker versions only print image ID; verify inspect
-    image_exists "$IMAGE_TAG" || die "image ${IMAGE_TAG} not present after load"
-  fi
+materialize_postgres_build_context
+if [[ "$INSTALL_MODE" == "binary" ]]; then
+  materialize_binary_smile_context
 else
-  echo "Image ${IMAGE_TAG} already present (use --force-load to reload)."
+  materialize_docker_image_smile_context
 fi
-
-# Materialize build context
-cp "${DOCKER_DIR}/init_postgresdb.sh" "${RUNTIME_DIR}/init_postgresdb.sh"
-cp "${DOCKER_DIR}/Dockerfile.postgres" "${RUNTIME_DIR}/Dockerfile.postgres"
-cp "${DOCKER_DIR}/Dockerfile.smilecdr" "${RUNTIME_DIR}/Dockerfile.smilecdr"
-# Substitute ARG defaults in Dockerfiles for clarity (compose also passes build args)
-sed -i.bak "s|ARG POSTGRES_TAG=.*|ARG POSTGRES_TAG=${POSTGRES_TAG}|" "${RUNTIME_DIR}/Dockerfile.postgres"
-sed -i.bak "s|ARG SMILECDR_IMAGE=.*|ARG SMILECDR_IMAGE=${IMAGE_TAG}|" "${RUNTIME_DIR}/Dockerfile.smilecdr"
-rm -f "${RUNTIME_DIR}/Dockerfile.postgres.bak" "${RUNTIME_DIR}/Dockerfile.smilecdr.bak"
-
-CONFIG_PATH="${RUNTIME_DIR}/cdr-config-Master.properties"
-echo "Extracting default cdr-config-Master.properties from ${IMAGE_TAG}..."
-extract_config_from_image "$IMAGE_TAG" "$CONFIG_PATH"
-patch_smile_config "$CONFIG_PATH" "$DB_CDR_NAME" "$DB_CDR_USER" "$DB_CDR_PASSWORD"
 
 render_compose \
   "${DOCKER_DIR}/compose.template.yml" \
   "$COMPOSE_FILE" \
   "$SMILE_VERSION" \
   "$POSTGRES_TAG" \
-  "$SMILECDR_PLATFORM"
+  "$SMILECDR_PLATFORM" \
+  "$INSTALL_MODE"
 
 echo "Starting stack..."
 docker compose -f "$COMPOSE_FILE" --project-name "$PROJECT_NAME" "${COMPOSE_ENV_ARGS[@]}" up -d --build
+verify_smile_service_image "$INSTALL_MODE"
 
 cat <<EOF
 

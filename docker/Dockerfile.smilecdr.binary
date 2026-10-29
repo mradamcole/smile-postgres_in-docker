@@ -1,0 +1,35 @@
+FROM --platform=linux/arm64 \
+  registry.access.redhat.com/ubi9/openjdk-21:1.21
+
+USER 0
+
+RUN microdnf install -y \
+      fontconfig freetype \
+      dejavu-sans-fonts dejavu-serif-fonts \
+      dejavu-sans-mono-fonts \
+    && microdnf clean all \
+    && useradd --create-home --uid 1002 \
+         --shell /bin/bash smile
+
+WORKDIR /home/smile
+
+COPY --chown=smile:smile smilecdr/ \
+     /home/smile/smilecdr/
+
+COPY --chown=smile:smile cdr-config-Master.properties \
+     /home/smile/smilecdr/classes/cdr-config-Master.properties
+
+RUN mkdir -p \
+      /home/smile/smilecdr/database \
+      /home/smile/smilecdr/log \
+      /home/smile/smilecdr/tmp \
+      /home/smile/smilecdr/activemq-data \
+    && chown -R smile:smile /home/smile/smilecdr
+
+USER smile
+
+WORKDIR /home/smile/smilecdr
+
+EXPOSE 8000 8001 9000 9100 9200 9201
+
+CMD ["/home/smile/smilecdr/bin/smilecdr", "run"]

@@ -1,6 +1,7 @@
 services:
   postgresdb:
     container_name: postgres_cdr-__SMILECDR_VERSION__
+    platform: __SMILECDR_PLATFORM__
     build:
       context: .
       dockerfile: Dockerfile.postgres
@@ -34,9 +35,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.smilecdr
-      args:
-        SMILECDR_IMAGE: smilecdr:__SMILECDR_VERSION__
-    image: smilecdr_pg:__SMILECDR_VERSION__
+__SMILECDR_BUILD_ARGS__
+    image: __SMILECDR_SERVICE_IMAGE__
     depends_on:
       postgresdb:
         condition: service_healthy
